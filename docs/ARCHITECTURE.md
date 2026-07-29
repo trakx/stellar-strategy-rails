@@ -1,7 +1,7 @@
 # Technical Architecture — Stellar Strategy Rails
 
 **Product:** Tokenized wrapper for the EDO Theory automated long/short strategy
-**Chain:** Stellar (Classic Assets + Horizon; no custom smart contracts in scope)
+**Chain:** Stellar — hybrid architecture: Classic Asset for the token, Soroban smart contracts for on-chain logic
 **Settlement asset:** native USDC on Stellar
 **Issuer:** Trakx (AMF-registered, France)
 
@@ -9,10 +9,10 @@
 
 ## 1. Design principles
 
-1. **Compliance as a protocol primitive.** The strategy token is a Stellar Classic Asset with `AUTH_REQUIRED` and `AUTH_REVOCABLE` flags. Only accounts whose trustlines Trakx has explicitly authorized can hold the token. No custom contract code means no bespoke audit surface and a compliance model that regulators can verify directly against Stellar's documented semantics. (A Stellar Asset Contract is created automatically for the asset, keeping future Soroban interoperability open without migration.)
+1. **Hybrid architecture: Classic for value, Soroban for logic.** The strategy token is a Stellar Classic Asset with `AUTH_REQUIRED` and `AUTH_REVOCABLE` flags — investor access control enforced at protocol level, with battle-tested security and minimal fees for transfers. All programmable logic that belongs on-chain lives in Soroban smart contracts: the **NAV Oracle** and the **Subscription Escrow**. Contracts interact with the Classic Asset through its built-in Stellar Asset Contract (SAC) interface.
 2. **Execute-then-mint.** Tokens are only issued after the corresponding strategy exposure has been adjusted. Every token in circulation is therefore fully backed by the underlying position at all times. There are no liquidity pools and no on-chain market making: the chain is a distribution and ownership registry, not a liquidity venue.
-3. **Off-chain NAV, on-chain publication.** NAV is computed off-chain from constituent prices, accrued fees and management fees, then published on-chain as signed data. All mint/redeem operations price against the last published NAV. Mint/redeem at NAV acts as a natural arbitrage anchor for any secondary market that may emerge.
-4. **Internal ledger as source of truth.** Because issuance is primary (Trakx initiates every mint and redeem), the internal ledger records supply changes at execution time — before chain confirmation. Chain observation (streaming + sweep) is used for **reconciliation and verification**, never as the primary input to hedging decisions. A delayed stream can therefore never produce an incorrect hedge — only a reconciliation alert.
+3. **NAV computed off-chain, verifiable on-chain.** NAV is calculated off-chain by the same engine pricing Trakx's indices today (constituent prices, accrued fees, management fees), then published to the Soroban NAV Oracle as a signed submission. The oracle is the single on-chain pricing reference for all mint/redeem operations — and a composable price feed any other Soroban protocol can read.
+4. **Internal ledger as source of truth.** Because issuance is primary (Trakx initiates every mint and redeem), the internal ledger records supply changes at execution time — before chain confirmation. Chain observation (Horizon streaming, contract events, cursor sweep) is used for **reconciliation and verification**, never as the primary input to hedging decisions. A delayed stream can therefore never produce an incorrect hedge — only a reconciliation alert.
 5. **Investor settlement on Stellar; treasury mobility via CCTP.** Investors always pay and receive native USDC **on Stellar**. Moving funds between Stellar and the venues where the strategy executes (EVM-based exchange infrastructure) is an internal Trakx treasury operation using Circle's CCTP (native burn-and-mint USDC transfers between Stellar and CCTP-enabled chains). The investor-facing product surface never depends on, or is exposed to, the treasury leg.
 
 ## 2. Component overview
@@ -27,18 +27,22 @@ flowchart LR
     subgraph Trakx["Trakx Backend (C#/.NET, CQRS)"]
         KYC[KYC / Identity<br/>existing stack]
         CS[Compliance Service<br/>trustline authorization]
-        NAV[NAV Service<br/>calculation + publication]
+        NAV[NAV Service<br/>calculation + signed publication]
         MR[Mint/Redeem Engine<br/>execute-then-mint]
         LG[(Internal Ledger<br/>source of truth)]
-        RC[Reconciliation<br/>streaming + sweep]
+        RC[Reconciliation<br/>streaming + events + sweep]
         TR[Treasury Ops<br/>CCTP Stellar ↔ EVM]
     end
 
-    subgraph Stellar["Stellar Network"]
+    subgraph Soroban["Soroban Smart Contracts"]
+        ORC[NAVOracle<br/>SEP-40-compatible feed]
+        ESC[SubscriptionEscrow<br/>USDC custody for pending ops]
+    end
+
+    subgraph Stellar["Stellar — Classic Layer"]
         ISS[Issuer Account<br/>AUTH_REQUIRED · AUTH_REVOCABLE<br/>multisig, cold]
         DST[Distribution Account<br/>operational]
-        NDA[NAV Data Account<br/>manage_data entries]
-        USDC[USDC<br/>native asset]
+        USDC[USDC<br/>native asset / SAC]
     end
 
     subgraph Offchain["Strategy Infrastructure"]
@@ -47,29 +51,59 @@ flowchart LR
 
     W --> P
     P --> CS
-    P -->|subscribe / redeem| MR
+    P -->|subscribe / redeem| ESC
     KYC --> CS
     CS -->|SetTrustLineFlags| ISS
-    NAV -->|manage_data| NDA
+    NAV -->|submit_nav signed| ORC
+    ESC -->|events| MR
+    MR -->|finalize at oracle NAV| ESC
+    ORC -.->|price read| ESC
     MR --> LG
-    MR -->|payments / issuance| DST
+    MR -->|token issuance| DST
     MR -->|adjust exposure| EX
-    TR -->|CCTP burn/mint<br/>native USDC| USDC
-    TR --> EX
-    RC -->|Horizon streaming + cursor sweep| Stellar
+    ESC ---|SAC interface| USDC
+    RC -->|Horizon + contract events| Stellar
     RC --> LG
+    TR -->|CCTP burn/mint native USDC| USDC
+    TR --> EX
 ```
 
-## 3. Account model
+## 3. Account & contract model
 
-| Account | Role | Controls |
+| Component | Role | Controls |
 |---|---|---|
-| **Issuer** | Defines the asset; sets `AUTH_REQUIRED`, `AUTH_REVOCABLE`; authorizes/revokes trustlines | Cold; multisig (medium/high thresholds); keys under Trakx custody policy |
-| **Distribution** | Operational account for issuing tokens to investors and receiving them on redemption | Warm; limited balance; multisig on high-value ops |
-| **NAV data** | Holds `manage_data` entries: `nav_value`, `nav_timestamp`, `nav_currency` | Signed exclusively by the NAV service key |
-| **Subscription (USDC)** | Receives investor USDC on subscription; sources USDC payouts on redemption | Monitored via Horizon streaming |
+| **Issuer account** | Defines the Classic Asset; sets `AUTH_REQUIRED`, `AUTH_REVOCABLE`; authorizes/revokes trustlines | Cold; multisig (medium/high thresholds); keys under Trakx custody policy |
+| **Distribution account** | Operational account for issuing tokens to investors and receiving them on redemption | Warm; limited balance; multisig on high-value ops |
+| **NAVOracle (Soroban)** | On-chain NAV reference: stores latest NAV + history, validates publisher, exposes read functions | `require_auth()` on the authorized publisher address; upgrade/admin gated by issuer multisig |
+| **SubscriptionEscrow (Soroban)** | Holds investor USDC for pending subscriptions/redemptions; settles at oracle NAV; refund path | `require_auth()` on operator functions; refunds callable by depositor after timeout |
+| **Subscription flows (USDC)** | Monitored via Horizon streaming + contract events | |
 
-## 4. Investor onboarding & whitelist flow
+## 4. Soroban contracts
+
+### 4.1 NAVOracle
+
+A single, deliberately small Rust contract acting as the authoritative on-chain NAV feed for each strategy token.
+
+- **Interface:** SEP-40-compatible price feed functions (`lastprice`, `price(timestamp)`), plus `submit_nav(payload, signature)` for publication and `nav_age()` for staleness checks. SEP-40 compatibility makes the feed **composable**: any other Soroban protocol can consume Trakx product NAVs without custom integration.
+- **State (persistent storage):** `LATEST_NAV { value, timestamp }`, a bounded ring buffer of historical entries, `AUTHORIZED_PUBLISHER: Address`, `STALENESS_THRESHOLD: u64`. TTL on persistent entries is extended programmatically by the backend (state-rent maintenance).
+- **Publication flow:** the off-chain NAV service signs the payload; `submit_nav` enforces `require_auth()` on the publisher address and validates monotonic timestamps. On success the contract emits a `NAVUpdated(asset, value, timestamp)` event consumed by the backend, the reconciliation service and any third-party subscriber.
+- **Consumers:** the SubscriptionEscrow reads the oracle for settlement pricing; automated operations pause if `nav_age()` exceeds the staleness threshold.
+
+### 4.2 SubscriptionEscrow
+
+The contract that moves the money path of primary issuance on-chain while preserving execute-then-mint.
+
+- **Subscribe:** the investor calls `subscribe(amount)`; USDC moves from their wallet into the contract via the SAC. The contract records the pending intent and emits `SubscriptionRequested(investor, amount)`.
+- **Finalize:** after the backend confirms strategy exposure adjustment (the execute leg), it calls `finalize_subscription(investor)`. The contract reads the current NAV from NAVOracle, computes the token quantity, releases the USDC to the treasury path, and emits `SubscriptionSettled(investor, usdc, tokens, nav)`. Token issuance itself is a Classic Asset payment from the distribution account, executed by the backend in the same logical operation and reconciled against the event.
+- **Redeem:** symmetric — tokens are returned to the distribution account, `redeem` records intent, exposure is unwound, `finalize_redemption` pays out USDC from the contract at oracle NAV.
+- **Refund path:** if a pending operation is not finalized within a timeout, the depositor can call `refund()` and recover their USDC without any Trakx intervention — investor funds are never stranded on operational failure.
+- **Authorization:** operator functions gated with `require_auth()` on the operator address (no custom auth logic); depositor functions gated on the depositor's own address.
+
+### 4.3 Implementation practices
+
+Unit tests in Rust for every contract function; integration tests against Stellar testnet; persistent vs. temporary storage split to manage state rent; events for every state transition so off-chain services subscribe rather than poll. Contracts are audited before mainnet via the **Soroban Audit Bank** (SDF audit credits, delivered with SCF Tranche 3); no contract reaches mainnet before critical and high findings are remediated.
+
+## 5. Investor onboarding & whitelist flow
 
 ```mermaid
 sequenceDiagram
@@ -89,118 +123,98 @@ sequenceDiagram
     Note over C,S: Revocation: C can clear the flag at any time (AUTH_REVOCABLE)
 ```
 
-## 5. Mint flow (subscription, execute-then-mint)
+## 6. Mint flow (subscription, execute-then-mint)
 
 ```mermaid
 sequenceDiagram
     participant I as Investor (whitelisted)
-    participant P as Portal
+    participant ESC as SubscriptionEscrow (Soroban)
+    participant ORC as NAVOracle (Soroban)
     participant M as Mint/Redeem Engine
     participant L as Internal Ledger
     participant E as Exchange (strategy)
-    participant S as Stellar
-
     participant T as Treasury (CCTP)
 
-    I->>P: Subscribe (amount in USDC)
-    P->>M: Subscription request
-    I->>S: Send native USDC (Stellar) to subscription account
-    S-->>M: USDC payment detected (Horizon streaming)
-    M->>M: Price at last published NAV
+    I->>ESC: subscribe(amount) — USDC into escrow via SAC
+    ESC-->>M: SubscriptionRequested event
     M->>E: Adjust strategy exposure (execute first)
     E-->>M: Execution confirmed
     M->>L: Record mint (write-ahead: supply += q)
-    M->>S: Issue q tokens from distribution to investor
-    S-->>I: EDO tokens received
+    M->>ESC: finalize_subscription(investor)
+    ESC->>ORC: read NAV
+    ESC-->>M: SubscriptionSettled(usdc, q, nav) — USDC released to treasury path
+    M->>I: Issue q EDOT (Classic Asset payment from distribution)
     par Internal treasury leg (async, non-blocking)
-        T->>S: Burn USDC on Stellar (CCTP)
-        T->>E: Mint native USDC on EVM venue → fund exposure
+        T->>T: CCTP burn on Stellar → mint native USDC on EVM venue
     end
-    Note over L,S: Reconciliation later verifies chain state == ledger
-    Note over T: Treasury timing never blocks the investor flow
+    Note over ESC,I: If not finalized within timeout, investor calls refund() and recovers USDC
+    Note over L: Reconciliation later verifies chain state == ledger
 ```
 
-## 6. Redeem flow
+## 7. Redeem flow
 
 ```mermaid
 sequenceDiagram
     participant I as Investor
-    participant P as Portal
+    participant ESC as SubscriptionEscrow (Soroban)
+    participant ORC as NAVOracle (Soroban)
     participant M as Mint/Redeem Engine
     participant L as Internal Ledger
     participant E as Exchange (strategy)
-    participant S as Stellar
-
     participant T as Treasury (CCTP)
 
-    I->>P: Redeem (q tokens)
-    P->>M: Redemption request
-    I->>S: Send q tokens to distribution account
-    S-->>M: Token deposit detected
-    M->>M: Price at last published NAV
+    I->>ESC: redeem(q) — tokens returned to distribution, intent recorded
+    ESC-->>M: RedemptionRequested event
     M->>E: Unwind proportional exposure
     E-->>M: Execution confirmed
     opt Treasury leg (if Stellar-side USDC buffer is insufficient)
-        T->>E: Burn USDC on EVM venue (CCTP)
-        T->>S: Mint native USDC on Stellar
+        T->>T: CCTP burn on EVM venue → mint native USDC on Stellar
     end
     M->>L: Record redeem (write-ahead: supply -= q)
-    M->>S: Send native USDC (Stellar) payout to investor
-    S-->>I: USDC received
-    Note over M: Phase 3 adds performance fee accrual and slippage buffer to sizing
+    M->>ESC: finalize_redemption(investor)
+    ESC->>ORC: read NAV
+    ESC->>I: USDC payout at oracle NAV
 ```
 
-## 6a. Treasury operations (Stellar ↔ EVM via CCTP)
+## 8. Treasury operations (Stellar ↔ EVM via CCTP)
 
 The strategy executes on EVM-based exchange infrastructure, while investors settle exclusively in native USDC on Stellar. Trakx bridges the two internally using Circle's Cross-Chain Transfer Protocol (CCTP), which burns native USDC on the source chain and mints native USDC on the destination chain — no wrapped assets, no third-party bridges.
 
-- **Subscription direction:** USDC received on Stellar is moved to the execution venue as needed to fund exposure. This runs asynchronously; the execute-then-mint ordering is preserved because exposure adjustment (the risk-bearing step) always precedes token issuance.
-- **Redemption direction:** USDC is moved back to Stellar to fund investor payouts. A working USDC buffer is maintained on the Stellar side so that routine redemptions pay out immediately without waiting for a CCTP transfer.
+- **Subscription direction:** USDC released by the escrow is moved to the execution venue as needed to fund exposure. This runs asynchronously; the execute-then-mint ordering is preserved because exposure adjustment (the risk-bearing step) always precedes token issuance.
+- **Redemption direction:** USDC is moved back to Stellar to fund payouts. A working USDC buffer is maintained on the Stellar side so that routine redemptions pay out immediately without waiting for a CCTP transfer.
 - **Isolation:** the treasury leg is invisible to investors and never a dependency of the investor-facing flow. A delayed CCTP transfer affects internal buffer levels, not investor settlement.
 - **Reconciliation:** treasury movements are recorded in the internal ledger and reconciled against both chains, alongside the supply × NAV ≤ collateral invariant.
 
-## 7. NAV calculation & publication
+## 9. Reconciliation
 
-```mermaid
-flowchart TD
-    CP[Constituent prices<br/>market data feeds] --> CALC[NAV Calculation<br/>composition + accrued fees + management fees]
-    CALC --> SIGN[Sign NAV payload<br/>NAV service key]
-    SIGN --> PUB[manage_data on NAV Data Account<br/>nav_value · nav_timestamp · nav_currency]
-    PUB --> VER[Verification tooling<br/>anyone can verify freshness + signature]
-    CALC --> MRP[Mint/Redeem pricing]
-```
-
-- NAV is computed once, off-chain, from a single market-data source already operated by Trakx (APIs + websockets).
-- Publication cadence: daily (configurable). Mint/redeem operations always reference the last published NAV; staleness beyond a freshness threshold pauses automated operations and raises an alert.
-
-## 8. Reconciliation
-
-- **Real-time:** Horizon streaming on payments/effects for the issuer, distribution, NAV and subscription accounts.
-- **Sweep:** cursor-based periodic sweep over Horizon as a safety net for anything the stream misses (collector + reconciler pattern).
-- **Invariant checked:** circulating supply (chain) == internal ledger supply, and supply × NAV ≤ collateral held in the strategy infrastructure.
+- **Real-time:** Horizon streaming on payments/effects for the issuer, distribution and escrow-related accounts, plus **Soroban contract events** (`NAVUpdated`, `SubscriptionRequested/Settled`, `RedemptionRequested`) consumed as they are emitted.
+- **Sweep:** cursor-based periodic sweep over Horizon and contract event history as a safety net for anything the streams miss (collector + reconciler pattern).
+- **Invariants checked:** circulating supply (chain) == internal ledger supply; supply × NAV ≤ collateral held in the strategy infrastructure; escrow USDC balance == sum of pending intents.
 - Discrepancies never auto-correct money paths; they raise alerts for operator review.
 
-## 9. Trust boundaries & failure modes
+## 10. Trust boundaries & failure modes
 
 | Boundary | Risk | Mitigation |
 |---|---|---|
 | Issuer keys | Compromise = unauthorized issuance | Cold storage, multisig, minimal signing surface |
-| NAV publication | Wrong/stale NAV misprices mint/redeem | Signed payloads, freshness threshold pauses automation, dual-source price sanity checks |
-| Horizon streaming | Missed events | Write-ahead ledger (streams only verify), cursor sweep backfill |
+| NAVOracle publication | Wrong/stale NAV misprices settlement | `require_auth()` on publisher, monotonic timestamps, `nav_age()` staleness pause, dual-source price sanity checks off-chain before signing |
+| SubscriptionEscrow | Contract bug affecting custodied USDC | Small bounded surface, Rust unit + testnet integration tests, independent audit via Soroban Audit Bank before mainnet, refund path guarantees depositor recovery |
+| Horizon streaming / events | Missed events | Write-ahead ledger (streams only verify), cursor sweep backfill |
 | Exchange execution | Slippage between quote and fill | Execute-then-mint ordering; Phase 3 slippage buffer on sizing |
 | CCTP treasury leg | Delayed/failed cross-chain transfer | Internal-only operation (never blocks investor settlement); Stellar-side USDC buffer for routine redemptions; transfers reconciled in the internal ledger |
 | Investor wallet | Lost keys | `AUTH_REVOCABLE` + clawback-capable issuance policy enables regulated-issuer recovery procedures |
 
-## 10. Delivery phases (mapped to SCF tranches)
+## 11. Delivery phases (mapped to SCF tranches)
 
-| Phase | Deliverables | Chain surface |
+| Phase | Deliverables | Stellar surface |
 |---|---|---|
-| **1 — MVP** | Token issuance on testnet (flags, multisig), compliance & whitelist service, on-chain NAV publication | `SetOptions`, `ChangeTrust`, `SetTrustLineFlags`, `ManageData`, `Payment` |
-| **2 — Testnet** | Automated mint/redeem at NAV (Horizon streaming), investor portal (Stellar Wallets Kit: Freighter, xBull), reconciliation & reporting | Streaming, cursor pagination |
-| **3 — Mainnet** | Performance fee (high-water mark) & execution-risk framework, mainnet launch with OTC mint/redeem, production hardening & monitoring | Mainnet ops, runbooks |
+| **1 — MVP** | Token issuance on testnet (flags, multisig); compliance & whitelist service; **NAVOracle contract live on testnet** (SEP-40-compatible, signed publication, events) | `SetOptions`, `ChangeTrust`, `SetTrustLineFlags`, `Payment`; Soroban: contract deploy, `require_auth`, events, state rent |
+| **2 — Testnet** | **SubscriptionEscrow contract** + automated mint/redeem at oracle NAV; investor portal (Stellar Wallets Kit: Freighter, xBull); reconciliation & reporting incl. contract events | SAC token transfers, cross-contract reads, Horizon + events streaming |
+| **3 — Mainnet** | Performance fee (high-water mark) & execution-risk framework; **contract audit via Soroban Audit Bank**; mainnet launch with escrow-based mint/redeem; production hardening & monitoring | Mainnet ops, audited contract deploys, runbooks |
 
-## 11. Stack
+## 12. Stack
 
+- **Contracts:** Rust / Soroban SDK; soroban-rpc for simulation and submission
 - **Backend:** C#/.NET microservices (CQRS), .NET Stellar SDK, Horizon API
 - **Frontend:** React/TypeScript, [Stellar Wallets Kit](https://stellarwalletskit.dev/)
-- **Infra:** AWS EKS, PostgreSQL (internal ledger + reconciliation snapshots), existing Trakx observability stack (alerts on mint/redeem failures, NAV freshness, reconciliation breaks)
+- **Infra:** AWS EKS, PostgreSQL (internal ledger + reconciliation snapshots), existing Trakx observability stack (alerts on mint/redeem failures, NAV freshness, escrow balance, reconciliation breaks)
