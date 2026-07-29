@@ -105,16 +105,24 @@ Unit tests in Rust for every contract function; integration tests against Stella
 
 ## 5. Investor onboarding & whitelist flow
 
+KYC data collection follows **SEP-12**: the investor portal (or any SEP-12-compliant Stellar wallet) POSTs structured fields — name, address, country, income bracket, professional area — to a `/customer` endpoint on the Trakx backend. The identity verification step (document upload, photo, AML check) remains a hosted redirect to the existing provider (Shufti Pro / Sumsub): the backend generates the verification link, the user completes it on the provider's interface, and the backend receives the result via webhook. **No KYC data is written on-chain.** The only on-chain outcome is a `SetTrustLineFlags` operation authorizing the trustline once the investor passes all checks.
+
 ```mermaid
 sequenceDiagram
     participant I as Investor
-    participant P as Portal
-    participant K as Trakx KYC
+    participant P as Portal (SEP-12 client)
+    participant K as Trakx KYC Backend
+    participant V as Identity Provider (Shufti / Sumsub)
     participant C as Compliance Service
     participant S as Stellar
 
     I->>P: Connect wallet (Freighter / xBull)
-    I->>K: Complete KYC (existing Trakx flow)
+    I->>P: Fill personal info & compliance forms
+    P->>K: POST /customer (SEP-12 — structured fields only)
+    K-->>P: Return hosted identity verification link
+    P->>I: Redirect to identity provider
+    I->>V: Upload ID / passport (hosted flow — Trakx never touches documents)
+    V-->>K: Webhook — KYC approved + AML clear
     K-->>C: Investor approved (event)
     I->>S: Open trustline to EDO asset
     Note over S: Trustline exists but is NOT authorized yet
