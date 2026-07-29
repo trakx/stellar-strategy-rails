@@ -13,6 +13,7 @@
 2. **Execute-then-mint.** Tokens are only issued after the corresponding strategy exposure has been adjusted. Every token in circulation is therefore fully backed by the underlying position at all times. There are no liquidity pools and no on-chain market making: the chain is a distribution and ownership registry, not a liquidity venue.
 3. **Off-chain NAV, on-chain publication.** NAV is computed off-chain from constituent prices, accrued fees and management fees, then published on-chain as signed data. All mint/redeem operations price against the last published NAV. Mint/redeem at NAV acts as a natural arbitrage anchor for any secondary market that may emerge.
 4. **Internal ledger as source of truth.** Because issuance is primary (Trakx initiates every mint and redeem), the internal ledger records supply changes at execution time — before chain confirmation. Chain observation (streaming + sweep) is used for **reconciliation and verification**, never as the primary input to hedging decisions. A delayed stream can therefore never produce an incorrect hedge — only a reconciliation alert.
+5. **Investor settlement on Stellar; treasury mobility via CCTP.** Investors always pay and receive native USDC **on Stellar**. Moving funds between Stellar and the venues where the strategy executes (EVM-based exchange infrastructure) is an internal Trakx treasury operation using Circle's CCTP (native burn-and-mint USDC transfers between Stellar and CCTP-enabled chains). The investor-facing product surface never depends on, or is exposed to, the treasury leg.
 
 ## 2. Component overview
 
@@ -30,6 +31,7 @@ flowchart LR
         MR[Mint/Redeem Engine<br/>execute-then-mint]
         LG[(Internal Ledger<br/>source of truth)]
         RC[Reconciliation<br/>streaming + sweep]
+        TR[Treasury Ops<br/>CCTP Stellar ↔ EVM]
     end
 
     subgraph Stellar["Stellar Network"]
@@ -52,6 +54,8 @@ flowchart LR
     MR --> LG
     MR -->|payments / issuance| DST
     MR -->|adjust exposure| EX
+    TR -->|CCTP burn/mint<br/>native USDC| USDC
+    TR --> EX
     RC -->|Horizon streaming + cursor sweep| Stellar
     RC --> LG
 ```
@@ -96,9 +100,11 @@ sequenceDiagram
     participant E as Exchange (strategy)
     participant S as Stellar
 
+    participant T as Treasury (CCTP)
+
     I->>P: Subscribe (amount in USDC)
     P->>M: Subscription request
-    I->>S: Send USDC to subscription account
+    I->>S: Send native USDC (Stellar) to subscription account
     S-->>M: USDC payment detected (Horizon streaming)
     M->>M: Price at last published NAV
     M->>E: Adjust strategy exposure (execute first)
@@ -106,7 +112,12 @@ sequenceDiagram
     M->>L: Record mint (write-ahead: supply += q)
     M->>S: Issue q tokens from distribution to investor
     S-->>I: EDO tokens received
+    par Internal treasury leg (async, non-blocking)
+        T->>S: Burn USDC on Stellar (CCTP)
+        T->>E: Mint native USDC on EVM venue → fund exposure
+    end
     Note over L,S: Reconciliation later verifies chain state == ledger
+    Note over T: Treasury timing never blocks the investor flow
 ```
 
 ## 6. Redeem flow
@@ -120,6 +131,8 @@ sequenceDiagram
     participant E as Exchange (strategy)
     participant S as Stellar
 
+    participant T as Treasury (CCTP)
+
     I->>P: Redeem (q tokens)
     P->>M: Redemption request
     I->>S: Send q tokens to distribution account
@@ -127,11 +140,24 @@ sequenceDiagram
     M->>M: Price at last published NAV
     M->>E: Unwind proportional exposure
     E-->>M: Execution confirmed
+    opt Treasury leg (if Stellar-side USDC buffer is insufficient)
+        T->>E: Burn USDC on EVM venue (CCTP)
+        T->>S: Mint native USDC on Stellar
+    end
     M->>L: Record redeem (write-ahead: supply -= q)
-    M->>S: Send USDC payout to investor
+    M->>S: Send native USDC (Stellar) payout to investor
     S-->>I: USDC received
     Note over M: Phase 3 adds performance fee accrual and slippage buffer to sizing
 ```
+
+## 6a. Treasury operations (Stellar ↔ EVM via CCTP)
+
+The strategy executes on EVM-based exchange infrastructure, while investors settle exclusively in native USDC on Stellar. Trakx bridges the two internally using Circle's Cross-Chain Transfer Protocol (CCTP), which burns native USDC on the source chain and mints native USDC on the destination chain — no wrapped assets, no third-party bridges.
+
+- **Subscription direction:** USDC received on Stellar is moved to the execution venue as needed to fund exposure. This runs asynchronously; the execute-then-mint ordering is preserved because exposure adjustment (the risk-bearing step) always precedes token issuance.
+- **Redemption direction:** USDC is moved back to Stellar to fund investor payouts. A working USDC buffer is maintained on the Stellar side so that routine redemptions pay out immediately without waiting for a CCTP transfer.
+- **Isolation:** the treasury leg is invisible to investors and never a dependency of the investor-facing flow. A delayed CCTP transfer affects internal buffer levels, not investor settlement.
+- **Reconciliation:** treasury movements are recorded in the internal ledger and reconciled against both chains, alongside the supply × NAV ≤ collateral invariant.
 
 ## 7. NAV calculation & publication
 
@@ -162,6 +188,7 @@ flowchart TD
 | NAV publication | Wrong/stale NAV misprices mint/redeem | Signed payloads, freshness threshold pauses automation, dual-source price sanity checks |
 | Horizon streaming | Missed events | Write-ahead ledger (streams only verify), cursor sweep backfill |
 | Exchange execution | Slippage between quote and fill | Execute-then-mint ordering; Phase 3 slippage buffer on sizing |
+| CCTP treasury leg | Delayed/failed cross-chain transfer | Internal-only operation (never blocks investor settlement); Stellar-side USDC buffer for routine redemptions; transfers reconciled in the internal ledger |
 | Investor wallet | Lost keys | `AUTH_REVOCABLE` + clawback-capable issuance policy enables regulated-issuer recovery procedures |
 
 ## 10. Delivery phases (mapped to SCF tranches)
