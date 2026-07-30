@@ -195,14 +195,25 @@ The strategy executes on EVM-based exchange infrastructure, while investors sett
 - **Isolation:** the treasury leg is invisible to investors and never a dependency of the investor-facing flow. A delayed CCTP transfer affects internal buffer levels, not investor settlement.
 - **Reconciliation:** treasury movements are recorded in the internal ledger and reconciled against both chains, alongside the supply × NAV ≤ collateral invariant.
 
-## 9. Reconciliation
+## 9. Fee model
+
+Fees are computed off-chain by the NAV engine and reflected in the published NAV; collection happens on-chain through token issuance. Rates and splits are per-product configuration parameters — the rails stay strategy-agnostic.
+
+- **Management fee:** accrued daily in the NAV engine. The NAV published to the oracle is always **net of accrued fees**.
+- **Performance fee:** accrued continuously on profits above a **fund-level high-water mark (HWM)**: whenever gross NAV exceeds the HWM, the accrual grows and the published net NAV reflects it. Below the HWM, no performance fee accrues and the HWM does not decrease.
+- **Monthly crystallization:** at month-end, the accrued performance fee is collected by **minting new strategy tokens to dedicated fee recipient wallets** (share dilution — no assets leave the strategy). The HWM resets to the crystallization NAV and the accrual resets to zero. The fee mint is a Classic Asset payment from the distribution account, recorded in the internal ledger before issuance like any other supply event.
+- **Recipients:** fee tokens are split between Trakx and the strategy manager at contractually configured percentages, paid to dedicated recipient wallets. Recipient wallets hold authorized trustlines under the same protocol-level whitelist as any other holder (`AUTH_REQUIRED` applies universally).
+- **Reconciliation:** fee mints are first-class supply events covered by the invariants in the reconciliation section. Dilution changes token count, not collateral, so `supply × NAV ≤ collateral` is preserved by construction — NAV per token adjusts.
+- **Roadmap note:** the fund-level HWM is the phase-1 model (simple, battle-tested). A per-token HWM variant (HWM travels with each token, dual sale/month-end triggers, Gross-vs-Net NAV entry) is specified internally and may be evaluated for a later phase if greater precision is required.
+
+## 10. Reconciliation
 
 - **Real-time:** Horizon streaming on payments/effects for the issuer, distribution and escrow-related accounts, plus **Soroban contract events** (`NAVUpdated`, `SubscriptionRequested/Settled`, `RedemptionRequested`) consumed as they are emitted.
 - **Sweep:** cursor-based periodic sweep over Horizon and contract event history as a safety net for anything the streams miss (collector + reconciler pattern).
 - **Invariants checked:** circulating supply (chain) == internal ledger supply; supply × NAV ≤ collateral held in the strategy infrastructure; escrow USDC balance == sum of pending intents.
 - Discrepancies never auto-correct money paths; they raise alerts for operator review.
 
-## 10. Trust boundaries & failure modes
+## 11. Trust boundaries & failure modes
 
 | Boundary | Risk | Mitigation |
 |---|---|---|
@@ -215,15 +226,15 @@ The strategy executes on EVM-based exchange infrastructure, while investors sett
 | CCTP treasury leg | Delayed/failed cross-chain transfer | Internal-only operation (never blocks investor settlement); Stellar-side USDC buffer for routine redemptions; transfers reconciled in the internal ledger |
 | Investor wallet | Lost keys | `AUTH_REVOCABLE` + clawback-capable issuance policy enables regulated-issuer recovery procedures |
 
-## 11. Delivery phases (mapped to SCF tranches)
+## 12. Delivery phases (mapped to SCF tranches)
 
 | Phase | Deliverables | Stellar surface |
 |---|---|---|
 | **1 — MVP** | Token issuance on testnet (flags, multisig); compliance & whitelist service; **NAVOracle contract live on testnet** (SEP-40-compatible, signed publication, on-chain deviation bound, events) | `SetOptions`, `ChangeTrust`, `SetTrustLineFlags`, `Payment`; Soroban: contract deploy, `require_auth`, events, state rent |
 | **2 — Testnet** | **SubscriptionEscrow contract** + automated mint/redeem with next-NAV (forward-priced) settlement; investor portal (Stellar Wallets Kit: Freighter, xBull); reconciliation & reporting incl. contract events | SAC token transfers, cross-contract reads, Horizon + events streaming |
-| **3 — Mainnet** | Performance fee (high-water mark) & execution-risk framework; **contract audit via Soroban Audit Bank**; mainnet launch with escrow-based mint/redeem; production hardening & monitoring | Mainnet ops, audited contract deploys, runbooks |
+| **3 — Mainnet** | Fee engine (management fee + performance fee with fund-level HWM, monthly crystallization via share dilution) & execution-risk framework; **contract audit via Soroban Audit Bank**; mainnet launch with escrow-based mint/redeem; production hardening & monitoring | Mainnet ops, audited contract deploys, runbooks |
 
-## 12. Stack
+## 13. Stack
 
 - **Contracts:** Rust / Soroban SDK; soroban-rpc for simulation and submission
 - **Backend:** C#/.NET microservices (CQRS), .NET Stellar SDK, Horizon API
