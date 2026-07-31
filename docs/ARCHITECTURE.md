@@ -103,7 +103,7 @@ The contract that moves the money path of primary issuance on-chain while preser
 
 ### 4.3 Implementation practices
 
-Unit tests in Rust for every contract function; integration tests against Stellar testnet; persistent vs. temporary storage split to manage state rent; events for every state transition so off-chain services subscribe rather than poll. Contracts are audited before mainnet via the **Soroban Audit Bank** (SDF audit credits, delivered with SCF Tranche 3); no contract reaches mainnet before critical and high findings are remediated.
+Unit tests in Rust for every contract function; integration tests against Stellar testnet; persistent vs. temporary storage split to manage state rent; events for every state transition so off-chain services subscribe rather than poll. Before mainnet, both contracts go through a structured internal security review — threat modeling, invariant checks and property-based testing of state transitions, with authorization paths and TTL/state-rent handling reviewed explicitly; no contract reaches mainnet before critical and high findings are remediated.
 
 ## 5. Investor onboarding & whitelist flow
 
@@ -220,7 +220,7 @@ Fees are computed off-chain by the NAV engine and reflected in the published NAV
 | Issuer keys | Compromise = unauthorized issuance | Cold storage, multisig, minimal signing surface |
 | NAVOracle publication | Wrong/stale NAV misprices settlement | `require_auth()` on publisher, monotonic timestamps, on-chain deviation bound (circuit breaker) with admin override, `nav_age()` staleness pause, constituent-level sanity checks off-chain before signing |
 | Stale-price arbitrage | Subscribing at an outdated NAV after intraday market moves, at existing holders' expense | Forward pricing enforced on-chain: settlement only at a NAV published after the request timestamp; intraday publication cadence bounds the drift window |
-| SubscriptionEscrow | Contract bug affecting custodied USDC | Small bounded surface, Rust unit + testnet integration tests, independent audit via Soroban Audit Bank before mainnet, refund path guarantees depositor recovery |
+| SubscriptionEscrow | Contract bug affecting custodied USDC | Small bounded surface, Rust unit + testnet integration tests, structured security review (invariant + property-based testing) before mainnet, refund path guarantees depositor recovery |
 | Horizon streaming / events | Missed events | Write-ahead ledger (streams only verify), cursor sweep backfill |
 | Exchange execution | Slippage between quote and fill | Execute-then-mint ordering; Phase 3 slippage buffer on sizing |
 | CCTP treasury leg | Delayed/failed cross-chain transfer | Internal-only operation (never blocks investor settlement); Stellar-side USDC buffer for routine redemptions; transfers reconciled in the internal ledger |
@@ -232,7 +232,7 @@ Fees are computed off-chain by the NAV engine and reflected in the published NAV
 |---|---|---|
 | **1 — MVP** | Token issuance on testnet (flags, multisig); compliance & whitelist service; **NAVOracle contract live on testnet** (SEP-40-compatible, signed publication, on-chain deviation bound, events) | `SetOptions`, `ChangeTrust`, `SetTrustLineFlags`, `Payment`; Soroban: contract deploy, `require_auth`, events, state rent |
 | **2 — Testnet** | **SubscriptionEscrow contract** + automated mint/redeem with next-NAV (forward-priced) settlement; investor portal (Stellar Wallets Kit: Freighter, xBull); reconciliation & reporting incl. contract events | SAC token transfers, cross-contract reads, Horizon + events streaming |
-| **3 — Mainnet** | Fee engine (management fee + performance fee with fund-level HWM, monthly crystallization via share dilution) & execution-risk framework; **contract audit via Soroban Audit Bank**; mainnet launch with escrow-based mint/redeem; production hardening & monitoring | Mainnet ops, audited contract deploys, runbooks |
+| **3 — Mainnet** | Fee engine (management fee + performance fee with fund-level HWM, monthly crystallization via share dilution) & execution-risk framework; security review & remediation; mainnet launch with escrow-based mint/redeem; production hardening & monitoring | Mainnet ops, contract deploys, runbooks |
 
 ## 13. Stack
 
