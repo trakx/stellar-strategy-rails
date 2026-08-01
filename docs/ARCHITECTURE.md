@@ -78,7 +78,9 @@ flowchart LR
 | **SubscriptionEscrow (Soroban)** | Holds investor USDC for pending subscriptions/redemptions; settles at oracle NAV; refund path | `require_auth()` on operator functions; refunds callable by depositor after timeout |
 | **Subscription flows (USDC)** | Monitored via Soroban RPC (contract events + Classic operations) | |
 
-**Stellar Asset Contract deployment.** The EDO asset's **SAC instance is deployed at issuance** (`deploySACWithAsset`), so Soroban contracts — the SubscriptionEscrow in particular — interact with the token through the standard **SEP-41 token interface** (`transfer`, `burn`, and the admin functions `mint` / `set_authorized`). This is what lets the escrow hold and move the Classic Asset natively from contract code.
+**Stellar Asset Contract deployment.** The EDO asset's **SAC instance is deployed at issuance** (`deploySACWithAsset`), so Soroban contracts — the SubscriptionEscrow in particular — interact with the token through the standard **SEP-41 token interface** (`transfer`, `burn`, and the admin functions `mint` / `set_authorized`). This is what lets the escrow hold and move the Classic Asset natively from contract code. Because the escrow lives at a **contract address (`C…`)**, its authorization to hold the `AUTH_REQUIRED` asset is granted through **`set_authorized` on the SAC** — the contract-address counterpart of `SetTrustLineFlags`, which applies only to standard `G…` accounts (the investor whitelist flow of §5). This authorization is executed once by the issuer at deployment.
+
+**Decimal precision.** The EDO token uses **7 decimal places** — the Classic Asset on-ledger representation — declared in `stellar.toml` and reported by the SAC's `decimals()`; consumers must always read it rather than assume it. The NAV Oracle stores NAV as a **scaled integer (`i128`) with an explicit scale factor** carried in the contract, never as an implicit convention. The escrow performs settlement arithmetic in integer math at full precision and **rounds token quantities down** at mint (and USDC payouts down at redemption), so rounding dust always favors the fund and existing holders — the standard fund-administration convention — while the off-chain NAV engine computes at higher internal precision before quantizing to the published scale.
 
 **Standards note (SEP-57).** We track **SEP-57 — T-REX (Token for Regulated EXchanges)**, the OpenZeppelin-led draft that ports the ERC-3643 permissioned-token framework to Soroban. Phase 1 deliberately uses protocol-native Classic controls (`AUTH_REQUIRED` / `AUTH_REVOCABLE` / `AUTH_CLAWBACK_ENABLED`): they are battle-tested, require no bespoke compliance contracts, and keep the security surface minimal. As SEP-57 matures, the rails can adopt its richer on-chain identity and compliance-module model for products that need it, without changing the issuance architecture.
 
@@ -113,6 +115,8 @@ The contract that moves the money path of primary issuance on-chain while preser
 - **Authorization:** operator functions gated with `require_auth()` on the operator address (no custom auth logic); depositor functions gated on the depositor's own address.
 
 ### 4.3 Implementation practices
+
+Both contracts initialize via **`__constructor`**, which runs once and atomically at deployment — admin, publisher, token references and initial configuration are set in the deploy transaction itself, leaving no separate `initialize` call and therefore **no front-running window** between deployment and initialization. Both contracts are **upgradeable under governance**: `upgrade(new_wasm_hash)` is callable only by the admin (the issuer account's multisig) and takes effect after a **timelock**, announced through an on-chain event, so token holders always have time to observe — and if desired, exit via redemption — before a change activates.
 
 Unit tests in Rust for every contract function; integration tests against Stellar testnet; persistent vs. temporary storage split to manage state rent; events for every state transition so off-chain services subscribe rather than poll. Before mainnet, both contracts go through a structured internal security review — threat modeling, invariant checks and property-based testing of state transitions, with authorization paths and TTL/state-rent handling reviewed explicitly; no contract reaches mainnet before critical and high findings are remediated.
 
@@ -253,6 +257,17 @@ Fees are computed off-chain by the NAV engine and reflected in the published NAV
 | Exchange execution | Slippage between quote and fill | Execute-then-mint ordering; Phase 3 slippage buffer on sizing |
 | CCTP treasury leg | Delayed/failed cross-chain transfer | Internal-only operation (never blocks investor settlement); Stellar-side USDC buffer for routine redemptions; transfers reconciled in the internal ledger |
 | Investor wallet | Lost keys | `AUTH_CLAWBACK_ENABLED` (set at issuance, before any trustline) lets the issuer claw back and reissue tokens under a documented recovery procedure |
+
+### STRIDE threat model
+
+| Category | Threats in this system | Mitigations |
+|---|---|---|
+| **S**poofing | Unauthorized NAV publisher; forged operator/admin calls; impersonated investor | `require_auth()` (ed25519) on every privileged function — publisher on `submit_nav`, operator on `claim`/`finalize`/`release`, admin (issuer multisig) on `set_config`/`upgrade`; depositor functions bound to the depositor's own address |
+| **T**ampering | Manipulated NAV values; corrupted upstream price data; unauthorized state mutation | On-chain deviation bound (circuit breaker) with dual-signature override; monotonic timestamp validation; constituent-level outlier checks off-chain before signing; contract state mutable only through the authorized state machine |
+| **R**epudiation | Disputed subscriptions, settlements or fee mints | Every state transition emits an event on an immutable public ledger; transaction hashes as evidence; append-only operations record retained under regulated-issuer obligations |
+| **I**nformation disclosure | KYC/PII exposure; investor privacy | No KYC data on-chain — only the authorization outcome (trustline flag); identity verification on the provider's hosted flow, documents never touching Trakx or the chain; minimal on-chain footprint (amounts and addresses only) |
+| **D**enial of service | Publisher outage; RPC/stream outage; stale NAV; spam submissions | Fail-safe staleness pause (operations halt at the last valid price, never a wrong one); refund path + automatic backstop guarantee investor exit regardless of Trakx availability; on-chain minimum publication interval as rate-limit; Stellar-side USDC buffer for routine redemptions; cursor replay + Hubble backfill for observation recovery |
+| **E**levation of privilege | Compromised operator key; abuse of admin power | Operator authority is bounded by the state machine — it can only advance intents along predefined paths, with funds moving exclusively to the treasury path or back to depositors, never to arbitrary destinations; admin actions require the issuer multisig; upgrades additionally sit behind a timelock with on-chain announcement |
 
 ## 12. Delivery phases (mapped to SCF tranches)
 
