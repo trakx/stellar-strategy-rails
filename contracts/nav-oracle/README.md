@@ -138,6 +138,13 @@ scaling it to basis points would overflow is treated as a deviation breach
 rather than a panic: `price` arrives unvalidated from the publisher, and a typed
 rejection is the right answer to a nonsensical one.
 
+**Monitoring note.** Governance can widen `max_deviation_bps` through
+`set_config` and then publish through the ordinary `submit_nav`. That is not an
+authorization hole — it takes both signatures, the same as the override — but it
+emits `NavUpdated { overridden: false }` alongside a `ConfigUpdated`, so alerting
+that keys on `overridden == true` alone will not see a breaker bypass performed
+that way. Correlate `ConfigUpdated` with the publications that follow it.
+
 **Staleness fails safe on an empty feed.** `is_stale()` returns `true` when no
 NAV has ever been published, so a consumer that checks it cannot transact
 against an absent price during the window between deployment and first
@@ -150,6 +157,15 @@ through operator neglect. It runs from deployment, before any NAV exists, so it
 skips entries that have not been written yet: extending a missing entry traps,
 which would fail every run of the job and take the instance entry it was also
 meant to bump down with it.
+
+## Known coverage gap
+
+The final step of `apply_upgrade` — the host call that replaces the contract
+wasm — is not exercised by a unit test. Everything up to it is: both governance
+signatures, the pending-upgrade record, and the timelock gate opening once the
+deadline passes. Driving the last step needs a second contract's wasm installed
+on the ledger, which the in-memory test environment does not provide; closing it
+belongs with the Phase 1 testnet integration.
 
 ## Not in this contract
 

@@ -97,6 +97,15 @@ pub struct PendingUpgrade {
 /// one TTL to maintain). The NAV itself and its history live in `persistent`
 /// storage: they are the contract's durable record and must outlive the
 /// instance entry's rent cycle.
+///
+/// Persistent rather than temporary is also a safety property, not only a
+/// durability one. Every invariant in `record_nav` — monotonicity, the rate
+/// limit, the deviation bound — is evaluated against the last record, so it is
+/// conditional on that record being readable. An archived *persistent* entry
+/// fails the transaction rather than reading as absent, so the invariants
+/// cannot be skipped; a *temporary* entry expires into `None`, and a submission
+/// after expiry would pass with nothing but the sign and timestamp checks
+/// applied. Do not move these two keys to temporary storage to save rent.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataKey {
