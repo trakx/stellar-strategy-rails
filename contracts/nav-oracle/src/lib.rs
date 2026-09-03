@@ -98,8 +98,15 @@ impl NavOracle {
     /// Publish a NAV that legitimately breaches the deviation bound.
     ///
     /// Reserved for genuine extreme market moves. Requires the admin **and** the
-    /// independent override admin to sign; every other validation rule — the
-    /// rate limit, monotonicity, the future-timestamp check — still applies.
+    /// independent override admin to sign.
+    ///
+    /// Bypasses the deviation bound *and* the rate limit: the override exists to
+    /// unblock a feed the circuit breaker has stopped, and a rejected submission
+    /// does not advance the last publication time, so the rate limit would
+    /// otherwise keep the feed mispriced for the rest of the interval. The two
+    /// signatures are the spam control here; the rate limit protects the
+    /// single-key publisher path, which this is not. Monotonicity, the sign
+    /// check and the future-timestamp check still apply.
     pub fn submit_nav_override(env: Env, price: i128, timestamp: u64) -> Result<(), Error> {
         admin(&env).require_auth();
         override_admin(&env).require_auth();
@@ -324,7 +331,7 @@ impl PriceFeedTrait for NavOracle {
 
 /// The single write path. Every rule is enforced here, and any violation
 /// returns before a byte of state is written or an event is emitted.
-fn record_nav(env: &Env, price: i128, timestamp: u64, bypass_deviation: bool) -> Result<(), Error> {
+fn record_nav(env: &Env, price: i128, timestamp: u64, is_override: bool) -> Result<(), Error> {
     if price <= 0 {
         return Err(Error::InvalidPrice);
     }
@@ -340,11 +347,10 @@ fn record_nav(env: &Env, price: i128, timestamp: u64, bypass_deviation: bool) ->
         if tick <= last.timestamp {
             return Err(Error::TimestampNotMonotonic);
         }
-        if now.saturating_sub(last.published_at) < config.min_submission_interval {
+        if !is_override && now.saturating_sub(last.published_at) < config.min_submission_interval {
             return Err(Error::SubmissionTooSoon);
         }
-        if !bypass_deviation && deviation_bps(last.price, price) > config.max_deviation_bps as i128
-        {
+        if !is_override && !within_deviation_bound(last.price, price, config.max_deviation_bps) {
             return Err(Error::DeviationExceeded);
         }
     }
@@ -374,17 +380,25 @@ fn record_nav(env: &Env, price: i128, timestamp: u64, bypass_deviation: bool) ->
         price: record.price,
         timestamp: record.timestamp,
         published_at: record.published_at,
-        overridden: bypass_deviation,
+        overridden: is_override,
     }
     .publish(env);
 
     Ok(())
 }
 
-/// Absolute deviation from `previous` to `current`, in basis points.
-fn deviation_bps(previous: i128, current: i128) -> i128 {
-    let delta = (current - previous).abs();
-    delta * BPS_DENOMINATOR / previous
+/// Whether the move from `previous` to `current` is within `max_bps`.
+///
+/// Both values are strictly positive by construction, so the subtraction cannot
+/// overflow; scaling to basis points can, for a NAV far beyond any plausible
+/// fund value. That is treated as a breach rather than a panic — the publisher's
+/// `price` is an unvalidated `i128`, and a typed rejection is the correct
+/// response to a nonsensical one.
+fn within_deviation_bound(previous: i128, current: i128, max_bps: u32) -> bool {
+    match (current - previous).abs().checked_mul(BPS_DENOMINATOR) {
+        Some(scaled) => scaled / previous <= max_bps as i128,
+        None => false,
+    }
 }
 
 /// SEP-40 tick: `floor(timestamp / resolution) * resolution`.

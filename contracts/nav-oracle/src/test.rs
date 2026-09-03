@@ -404,14 +404,36 @@ fn override_admits_an_extreme_move_but_needs_both_signatures() {
 }
 
 #[test]
-fn override_bypasses_only_the_deviation_bound() {
+fn override_is_not_blocked_by_the_rate_limit() {
+    // The sequence the circuit breaker actually produces: a legitimate extreme
+    // move is rejected, an operator alert fires, and the override follows
+    // immediately — well inside the minimum interval, since the rejection never
+    // advanced the last publication time.
+    let setup = Setup::with_config(OracleConfig {
+        min_submission_interval: 2 * HOUR,
+        ..config()
+    });
+    let client = setup.client().mock_all_auths();
+    client.submit_nav(&(100 * ONE), &START);
+
+    setup.advance(HOUR);
+    assert_eq!(
+        client.try_submit_nav(&(130 * ONE), &setup.now()),
+        Err(Ok(Error::SubmissionTooSoon))
+    );
+
+    client.submit_nav_override(&(130 * ONE), &setup.now());
+    assert_eq!(client.latest_nav().unwrap().price, 130 * ONE);
+}
+
+#[test]
+fn override_bypasses_only_the_deviation_bound_and_the_rate_limit() {
     let setup = Setup::new();
     let client = setup.client().mock_all_auths();
     client.submit_nav(&(100 * ONE), &START);
     setup.advance(HOUR);
 
-    // Monotonicity, the rate limit and the sign check are not part of the
-    // override's remit.
+    // Monotonicity and the sign check are not part of the override's remit.
     assert_eq!(
         client.try_submit_nav_override(&(130 * ONE), &START),
         Err(Ok(Error::TimestampNotMonotonic))
@@ -494,6 +516,20 @@ fn price_lookup_trims_the_requested_timestamp_to_the_tick() {
         })
     );
     assert_eq!(client.price(&setup.quote, &(START_TICK - 1)), None);
+}
+
+#[test]
+fn price_returns_none_for_a_tick_the_publisher_skipped() {
+    let setup = Setup::new();
+    let client = setup.client().mock_all_auths();
+    client.submit_nav(&(100 * ONE), &START);
+
+    // The routine case for a daily NAV on an hourly tick: most ticks carry no
+    // record, and SEP-40 requires `None` rather than the nearest neighbour.
+    setup.advance(6 * HOUR);
+    client.submit_nav(&(101 * ONE), &setup.now());
+
+    assert_eq!(client.price(&setup.quote, &(START_TICK + 3 * HOUR)), None);
 }
 
 #[test]

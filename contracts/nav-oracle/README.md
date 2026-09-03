@@ -16,7 +16,7 @@ No local Rust or Stellar toolchain is required; the Docker image *is* the
 toolchain.
 
 ```
-make test     # 23 unit tests
+make test     # 25 unit tests
 make build    # release .wasm for wasm32v1-none
 make lint     # clippy, warnings denied
 make check    # fmt + lint + test
@@ -50,7 +50,7 @@ an error: handling is the consumer's to decide.
 |---|---|---|
 | `__constructor(admin, override_admin, publisher, feed, config)` | — | Runs once, atomically, in the deploy transaction |
 | `submit_nav(price, timestamp)` | publisher | Publish a NAV, subject to every validation rule |
-| `submit_nav_override(price, timestamp)` | admin **and** override admin | Admit a genuine extreme move past the deviation bound |
+| `submit_nav_override(price, timestamp)` | admin **and** override admin | Admit a genuine extreme move past the deviation bound and the rate limit |
 | `latest_nav()` | — | Latest record, including `published_at` |
 | `nav_age()` / `is_stale()` | — | Staleness, for the consumer's pause decision |
 | `set_config(config)` | admin | Retune risk parameters without a redeploy |
@@ -70,7 +70,7 @@ implemented and covered.
 | Monotonic timestamps | strict tick comparison in `record_nav` | `rejects_ticks_that_are_not_strictly_later` |
 | Minimum-interval guard rate-limits submissions | `min_submission_interval` | `rate_limits_submissions_to_the_minimum_interval` |
 | Circuit breaker: reject beyond `MAX_DEVIATION`, **state untouched, no event** | `max_deviation_bps` in `record_nav` | `deviation_beyond_the_bound_is_rejected_leaving_state_untouched` |
-| Override path gated on a second, independent admin signature | `submit_nav_override` | `override_admits_an_extreme_move_but_needs_both_signatures`, `override_bypasses_only_the_deviation_bound` |
+| Override path gated on a second, independent admin signature | `submit_nav_override` | `override_admits_an_extreme_move_but_needs_both_signatures`, `override_bypasses_only_the_deviation_bound_and_the_rate_limit`, `override_is_not_blocked_by_the_rate_limit` |
 | `NAVUpdated` event on every accepted publication | `NavUpdated` (`#[contractevent]`) | `submit_nav_stores_the_record_and_emits_the_event` |
 | `nav_age()` staleness threshold pauses dependent operations | `nav_age()`, `is_stale()` | `nav_age_grows_and_crosses_the_staleness_threshold` |
 | NAV as scaled `i128` with an explicit scale factor | `FeedDefinition::decimals` | `constructor_stores_feed_definition_and_config` |
@@ -103,6 +103,16 @@ state and emits no event; it surfaces as a failed transaction that the publisher
 turns into an operator alert. Meanwhile `nav_age()` keeps growing, and dependent
 operations pause once the staleness threshold is crossed. The system fails safe
 — paused at the last valid price — rather than settling at a wrong one.
+
+**The override bypasses the rate limit too.** A rejected submission does not
+advance the last publication time, so a feed stopped by the circuit breaker
+would otherwise stay mispriced until the minimum interval elapsed — defeating
+the purpose of an override, which exists to unblock it. The two independent
+signatures are the spam control on that path; the rate limit protects the
+single-key publisher path, which the override is not. A NAV so large that
+scaling it to basis points would overflow is treated as a deviation breach
+rather than a panic: `price` arrives unvalidated from the publisher, and a typed
+rejection is the right answer to a nonsensical one.
 
 **Staleness fails safe on an empty feed.** `is_stale()` returns `true` when no
 NAV has ever been published, so a consumer that checks it cannot transact
