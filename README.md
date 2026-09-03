@@ -19,6 +19,23 @@ The rails are strategy-agnostic: once validated with EDO, additional tokenized p
 ## Documentation
 
 - [Technical Architecture](docs/ARCHITECTURE.md) — components, account model, flows (onboarding, mint, redeem, NAV publication, reconciliation), trust boundaries, and delivery phases.
+- [NAVOracle contract](contracts/nav-oracle/README.md) — interface, specification traceability and design notes for the first Soroban contract.
+
+## Contracts
+
+Soroban contracts live under `contracts/`, built and tested entirely in Docker —
+no local Rust or Stellar toolchain required:
+
+```
+make test     # unit tests
+make build    # release .wasm for wasm32v1-none
+make check    # fmt + clippy + tests
+```
+
+| Contract | Phase | Status |
+|---|---|---|
+| [`nav-oracle`](contracts/nav-oracle) | 1 | Implemented — SEP-40 price feed, signed publication, on-chain deviation bound, governed upgrade |
+| `subscription-escrow` | 2 | Specified ([§4.2](docs/ARCHITECTURE.md)) |
 
 ## Delivery phases
 

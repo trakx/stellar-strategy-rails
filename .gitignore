@@ -1,0 +1,5 @@
+target/
+.stellar/
+*.wasm
+artifacts/
+test_snapshots/
