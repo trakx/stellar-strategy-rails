@@ -78,6 +78,8 @@ pub struct OracleConfig {
     /// Capacity of the historical ring buffer, in records.
     pub history_size: u32,
     /// Seconds an upgrade must sit announced on-chain before it can be applied.
+    /// Bounded by the contract so that governance cannot set it to zero and
+    /// upgrade in a single transaction.
     pub upgrade_timelock: u64,
 }
 
@@ -99,7 +101,7 @@ pub struct PendingUpgrade {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataKey {
     Admin,
-    OverrideAdmin,
+    CoAdmin,
     Publisher,
     Feed,
     Config,
@@ -134,6 +136,10 @@ pub enum Error {
     UpgradeTimelockActive = 9,
     /// `schedule_upgrade` while another upgrade is already announced.
     UpgradeAlreadyScheduled = 10,
+    /// The two governance addresses, or the publisher, are not distinct.
+    RolesNotDistinct = 11,
+    /// The valuation time is older than the staleness window.
+    TimestampTooOld = 12,
 }
 
 /// Emitted on every accepted NAV publication. The off-chain reconciliation
@@ -155,6 +161,14 @@ pub struct NavUpdated {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigUpdated {
     pub config: OracleConfig,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernanceUpdated {
+    #[topic]
+    pub admin: Address,
+    pub co_admin: Address,
 }
 
 #[contractevent]

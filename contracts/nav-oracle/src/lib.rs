@@ -11,12 +11,16 @@
 //! The contract is deliberately small. Its safety properties are:
 //!
 //! - only the authorized publisher can move the price (`require_auth`);
-//! - ticks are strictly monotonic and never ahead of the ledger;
+//! - every privileged action — configuration, key rotation, the deviation
+//!   override, upgrades — requires **both** governance signatures, so no single
+//!   key can reach a price the circuit breaker would have rejected;
+//! - ticks are strictly monotonic, never ahead of the ledger, and never older
+//!   than the staleness window;
 //! - a submission deviating beyond the configured bound is **rejected**, leaving
 //!   state untouched and emitting nothing — the system pauses at the last valid
 //!   price rather than settling at a wrong one;
-//! - genuine extreme moves pass through a separate path gated on a second,
-//!   independent admin signature;
+//! - genuine extreme moves pass through a separate path, gated on the same two
+//!   signatures and auditable in the event it emits;
 //! - `is_stale()` fails safe: it reports stale both when the NAV is old and when
 //!   no NAV exists at all.
 //!
@@ -36,6 +40,15 @@ const TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
 const TTL_EXTEND_TO: u32 = 90 * DAY_IN_LEDGERS;
 
 const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Bounds on `OracleConfig`, enforced by the contract rather than left to
+/// governance. A zero timelock would let an upgrade be announced and applied in
+/// one transaction, defeating the announcement; an unbounded one would overflow
+/// the deadline arithmetic. History is capped because the whole buffer is
+/// deserialized and rewritten on every publication.
+const MIN_UPGRADE_TIMELOCK: u64 = 24 * 60 * 60;
+const MAX_UPGRADE_TIMELOCK: u64 = 90 * 24 * 60 * 60;
+const MAX_HISTORY_SIZE: u32 = 100;
 
 #[contract]
 pub struct NavOracle;
@@ -58,12 +71,14 @@ impl NavOracle {
     /// `initialize` call and therefore no window in which an unconfigured
     /// contract exists on-chain.
     ///
-    /// `admin` and `override_admin` must be independent signers: together they
-    /// gate the deviation-bound override.
+    /// `admin` and `co_admin` are the two governance signers: every privileged
+    /// action requires both. They must be distinct from each other and from the
+    /// publisher — the same address in two roles would silently collapse the
+    /// 2-of-2 into a single signature.
     pub fn __constructor(
         env: Env,
         admin: Address,
-        override_admin: Address,
+        co_admin: Address,
         publisher: Address,
         feed: FeedDefinition,
         config: OracleConfig,
@@ -71,11 +86,12 @@ impl NavOracle {
         if feed.resolution == 0 {
             return Err(Error::InvalidConfig);
         }
+        validate_roles(&admin, &co_admin, &publisher)?;
         validate_config(&config)?;
 
         let storage = env.storage().instance();
         storage.set(&DataKey::Admin, &admin);
-        storage.set(&DataKey::OverrideAdmin, &override_admin);
+        storage.set(&DataKey::CoAdmin, &co_admin);
         storage.set(&DataKey::Publisher, &publisher);
         storage.set(&DataKey::Feed, &feed);
         storage.set(&DataKey::Config, &config);
@@ -97,19 +113,18 @@ impl NavOracle {
 
     /// Publish a NAV that legitimately breaches the deviation bound.
     ///
-    /// Reserved for genuine extreme market moves. Requires the admin **and** the
-    /// independent override admin to sign.
+    /// Reserved for genuine extreme market moves. Requires both governance
+    /// signatures, like every other privileged action.
     ///
     /// Bypasses the deviation bound *and* the rate limit: the override exists to
     /// unblock a feed the circuit breaker has stopped, and a rejected submission
     /// does not advance the last publication time, so the rate limit would
     /// otherwise keep the feed mispriced for the rest of the interval. The two
     /// signatures are the spam control here; the rate limit protects the
-    /// single-key publisher path, which this is not. Monotonicity, the sign
-    /// check and the future-timestamp check still apply.
+    /// single-key publisher path, which this is not. Monotonicity and the
+    /// timestamp checks still apply.
     pub fn submit_nav_override(env: Env, price: i128, timestamp: u64) -> Result<(), Error> {
-        admin(&env).require_auth();
-        override_admin(&env).require_auth();
+        require_governance(&env);
         record_nav(&env, price, timestamp, true)
     }
 
@@ -150,8 +165,8 @@ impl NavOracle {
         admin(&env)
     }
 
-    pub fn override_admin(env: Env) -> Address {
-        override_admin(&env)
+    pub fn co_admin(env: Env) -> Address {
+        co_admin(&env)
     }
 
     pub fn publisher(env: Env) -> Address {
@@ -167,7 +182,7 @@ impl NavOracle {
     /// Retune risk parameters without redeploying. Applies to subsequent
     /// submissions only; records already accepted are never revisited.
     pub fn set_config(env: Env, config: OracleConfig) -> Result<(), Error> {
-        admin(&env).require_auth();
+        require_governance(&env);
         validate_config(&config)?;
         let storage = env.storage().instance();
         storage.set(&DataKey::Config, &config);
@@ -178,12 +193,35 @@ impl NavOracle {
 
     /// Rotate the publishing key. The NAV service's signing key is operational
     /// and rotates on a schedule; the feed identity does not.
-    pub fn set_publisher(env: Env, publisher: Address) {
-        admin(&env).require_auth();
+    ///
+    /// This needs both governance signatures for the same reason `set_config`
+    /// does: a single key able to install its own publisher could publish any
+    /// value through `submit_nav`, reaching the outcome the override path is
+    /// meant to gate. Rotation stays immediate rather than timelocked, because
+    /// its urgent case is a suspected key compromise.
+    pub fn set_publisher(env: Env, publisher: Address) -> Result<(), Error> {
+        require_governance(&env);
+        validate_roles(&admin(&env), &co_admin(&env), &publisher)?;
         let storage = env.storage().instance();
         storage.set(&DataKey::Publisher, &publisher);
         storage.extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         PublisherUpdated { publisher }.publish(&env);
+        Ok(())
+    }
+
+    /// Rotate the governance keys themselves, signed by both outgoing ones.
+    ///
+    /// Without this, a key known to be compromised could never be retired: it
+    /// could not act alone, but it would remain one half of the pair forever.
+    pub fn set_governance(env: Env, admin: Address, co_admin: Address) -> Result<(), Error> {
+        require_governance(&env);
+        validate_roles(&admin, &co_admin, &publisher(&env))?;
+        let storage = env.storage().instance();
+        storage.set(&DataKey::Admin, &admin);
+        storage.set(&DataKey::CoAdmin, &co_admin);
+        storage.extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        GovernanceUpdated { admin, co_admin }.publish(&env);
+        Ok(())
     }
 
     // --- Upgrade under governance -----------------------------------------
@@ -192,12 +230,17 @@ impl NavOracle {
     /// timelock, and the announcement is on-chain, so holders can observe — and
     /// if they wish, exit — before any change activates.
     pub fn schedule_upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), Error> {
-        admin(&env).require_auth();
+        require_governance(&env);
         let storage = env.storage().instance();
         if storage.has(&DataKey::PendingUpgrade) {
             return Err(Error::UpgradeAlreadyScheduled);
         }
-        let available_at = env.ledger().timestamp() + config(&env).upgrade_timelock;
+        // `upgrade_timelock` is bounded by `validate_config`, so this cannot
+        // overflow; `saturating_add` keeps that independent of the bound.
+        let available_at = env
+            .ledger()
+            .timestamp()
+            .saturating_add(config(&env).upgrade_timelock);
         storage.set(
             &DataKey::PendingUpgrade,
             &PendingUpgrade {
@@ -215,7 +258,7 @@ impl NavOracle {
     }
 
     pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
-        admin(&env).require_auth();
+        require_governance(&env);
         let storage = env.storage().instance();
         let pending: PendingUpgrade = storage
             .get(&DataKey::PendingUpgrade)
@@ -229,7 +272,7 @@ impl NavOracle {
     }
 
     pub fn apply_upgrade(env: Env) -> Result<(), Error> {
-        admin(&env).require_auth();
+        require_governance(&env);
         let storage = env.storage().instance();
         let pending: PendingUpgrade = storage
             .get(&DataKey::PendingUpgrade)
@@ -256,9 +299,16 @@ impl NavOracle {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        // The NAV entries do not exist until the first publication, and
+        // extending a missing entry traps. The maintenance job runs from
+        // deployment, so it must tolerate that window rather than fail every
+        // run — and take the instance entry with it.
         let persistent = env.storage().persistent();
-        persistent.extend_ttl(&DataKey::Latest, TTL_THRESHOLD, TTL_EXTEND_TO);
-        persistent.extend_ttl(&DataKey::History, TTL_THRESHOLD, TTL_EXTEND_TO);
+        for key in [DataKey::Latest, DataKey::History] {
+            if persistent.has(&key) {
+                persistent.extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            }
+        }
     }
 }
 
@@ -341,6 +391,12 @@ fn record_nav(env: &Env, price: i128, timestamp: u64, is_override: bool) -> Resu
     }
 
     let config = config(env);
+    // A valuation already older than the staleness window is not publishable:
+    // accepting one would stamp `published_at = now` on it, so the feed would
+    // report itself fresh while serving an ancient price.
+    if now.saturating_sub(timestamp) > config.staleness_threshold {
+        return Err(Error::TimestampTooOld);
+    }
     let tick = trim(timestamp, resolution(env));
 
     if let Some(last) = latest(env) {
@@ -407,11 +463,33 @@ fn trim(timestamp: u64, resolution: u32) -> u64 {
 }
 
 fn validate_config(config: &OracleConfig) -> Result<(), Error> {
-    if config.staleness_threshold == 0 || config.max_deviation_bps == 0 || config.history_size == 0
+    if config.staleness_threshold == 0
+        || config.max_deviation_bps == 0
+        || config.history_size == 0
+        || config.history_size > MAX_HISTORY_SIZE
+        || config.upgrade_timelock < MIN_UPGRADE_TIMELOCK
+        || config.upgrade_timelock > MAX_UPGRADE_TIMELOCK
     {
         return Err(Error::InvalidConfig);
     }
     Ok(())
+}
+
+/// The three roles must be held by three different addresses. `require_auth`
+/// called twice on one address is satisfied by one signature, so a shared
+/// address would turn the 2-of-2 into a 1-of-1 with no outward sign.
+fn validate_roles(admin: &Address, co_admin: &Address, publisher: &Address) -> Result<(), Error> {
+    if admin == co_admin || admin == publisher || co_admin == publisher {
+        return Err(Error::RolesNotDistinct);
+    }
+    Ok(())
+}
+
+/// Both governance signatures. Every privileged function goes through here, so
+/// that no single key can reach an outcome the other would have to approve.
+fn require_governance(env: &Env) {
+    admin(env).require_auth();
+    co_admin(env).require_auth();
 }
 
 fn to_price_data(record: &NavRecord) -> PriceData {
@@ -440,11 +518,8 @@ fn admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
-fn override_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get(&DataKey::OverrideAdmin)
-        .unwrap()
+fn co_admin(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::CoAdmin).unwrap()
 }
 
 fn publisher(env: &Env) -> Address {

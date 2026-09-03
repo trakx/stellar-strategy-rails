@@ -47,7 +47,7 @@ struct Setup {
     env: Env,
     contract_id: Address,
     admin: Address,
-    override_admin: Address,
+    co_admin: Address,
     publisher: Address,
     base: Asset,
     quote: Asset,
@@ -63,7 +63,7 @@ impl Setup {
         env.ledger().set_timestamp(START);
 
         let admin = Address::generate(&env);
-        let override_admin = Address::generate(&env);
+        let co_admin = Address::generate(&env);
         let publisher = Address::generate(&env);
         let base = feed().base;
         let quote = feed().quote;
@@ -72,7 +72,7 @@ impl Setup {
             NavOracle,
             (
                 admin.clone(),
-                override_admin.clone(),
+                co_admin.clone(),
                 publisher.clone(),
                 feed(),
                 config,
@@ -83,7 +83,7 @@ impl Setup {
             env,
             contract_id,
             admin,
-            override_admin,
+            co_admin,
             publisher,
             base,
             quote,
@@ -143,7 +143,7 @@ fn constructor_stores_feed_definition_and_config() {
     assert_eq!(client.feed(), feed());
     assert_eq!(client.config(), config());
     assert_eq!(client.admin(), setup.admin);
-    assert_eq!(client.override_admin(), setup.override_admin);
+    assert_eq!(client.co_admin(), setup.co_admin);
     assert_eq!(client.publisher(), setup.publisher);
 }
 
@@ -167,20 +167,35 @@ fn constructor_rejects_invalid_config() {
     invalid.history_size = 0;
 
     let env = Env::default();
-    let address = Address::generate(&env);
+    let (admin, co_admin, publisher) = (
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        env.register(
-            NavOracle,
-            (
-                address.clone(),
-                address.clone(),
-                address.clone(),
-                feed(),
-                invalid,
-            ),
-        )
+        env.register(NavOracle, (admin, co_admin, publisher, feed(), invalid))
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn constructor_rejects_an_address_holding_two_roles() {
+    // `require_auth` twice on one address is satisfied by a single signature,
+    // so a shared address would collapse the 2-of-2 with nothing to show for it.
+    let env = Env::default();
+    let shared = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    for roles in [
+        (shared.clone(), shared.clone(), other.clone()),
+        (shared.clone(), other.clone(), shared.clone()),
+        (other.clone(), shared.clone(), shared.clone()),
+    ] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.register(NavOracle, (roles.0, roles.1, roles.2, feed(), config()))
+        }));
+        assert!(result.is_err());
+    }
 }
 
 // --- Publication -----------------------------------------------------------
@@ -286,6 +301,27 @@ fn rejects_ticks_that_are_not_strictly_later() {
 
     client.submit_nav(&(101 * ONE), &setup.now());
     assert_eq!(client.latest_nav().unwrap().price, 101 * ONE);
+}
+
+#[test]
+fn rejects_a_valuation_older_than_the_staleness_window() {
+    let setup = Setup::new();
+    let client = setup.client().mock_all_auths();
+    setup.advance(10 * 24 * HOUR);
+
+    // A skewed clock or a replayed payload must not be able to publish an
+    // ancient valuation: `published_at` would be now, so the feed would report
+    // itself fresh while serving it.
+    let ancient = setup.now() - config().staleness_threshold - 1;
+    assert_eq!(
+        client.try_submit_nav(&(100 * ONE), &ancient),
+        Err(Ok(Error::TimestampTooOld))
+    );
+
+    // Just inside the window is fine.
+    let recent = setup.now() - config().staleness_threshold;
+    client.submit_nav(&(100 * ONE), &recent);
+    assert_eq!(client.latest_nav().unwrap().price, 100 * ONE);
 }
 
 #[test]
@@ -550,7 +586,7 @@ fn unknown_asset_returns_none_rather_than_an_error() {
 // --- Administration --------------------------------------------------------
 
 #[test]
-fn set_config_requires_the_admin_and_applies_only_to_later_submissions() {
+fn set_config_requires_governance_and_applies_only_to_later_submissions() {
     let setup = Setup::new();
     let client = setup.client();
     client.mock_all_auths().submit_nav(&(100 * ONE), &START);
@@ -586,6 +622,106 @@ fn set_config_requires_the_admin_and_applies_only_to_later_submissions() {
     assert_eq!(client.latest_nav().unwrap().price, 130 * ONE);
 }
 
+/// Invokes `$method` authorized by `$signer` alone, so that the second
+/// governance signature is genuinely absent rather than mocked away.
+macro_rules! signed_by_one {
+    ($setup:expr, $signer:expr, $fn_name:literal, ($($arg:expr),+ $(,)?), $method:ident) => {{
+        let setup = &$setup;
+        setup
+            .client()
+            .mock_auths(&[MockAuth {
+                address: $signer,
+                invoke: &MockAuthInvoke {
+                    contract: &setup.contract_id,
+                    fn_name: $fn_name,
+                    args: ($($arg.clone()),+,).into_val(&setup.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .$method($(&$arg),+)
+    }};
+}
+
+#[test]
+fn a_single_governance_key_cannot_reach_a_price_the_breaker_would_reject() {
+    let setup = Setup::new();
+    let client = setup.client();
+    client.mock_all_auths().submit_nav(&(100 * ONE), &START);
+    setup.advance(HOUR);
+
+    // The bypass this guards against: install your own publisher, or widen the
+    // deviation bound, and then publish anything through `submit_nav` — reaching
+    // the override's outcome without the second signature ever being given.
+    let own_publisher = Address::generate(&setup.env);
+    assert!(signed_by_one!(
+        setup,
+        &setup.admin,
+        "set_publisher",
+        (own_publisher),
+        try_set_publisher
+    )
+    .is_err());
+
+    let widened = OracleConfig {
+        max_deviation_bps: u32::MAX,
+        ..config()
+    };
+    assert!(signed_by_one!(setup, &setup.admin, "set_config", (widened), try_set_config).is_err());
+
+    // The co-admin alone gets no further.
+    assert!(signed_by_one!(
+        setup,
+        &setup.co_admin,
+        "set_config",
+        (widened),
+        try_set_config
+    )
+    .is_err());
+
+    assert_eq!(client.publisher(), setup.publisher);
+    assert_eq!(client.config(), config());
+    assert_eq!(
+        client
+            .mock_all_auths()
+            .try_submit_nav(&(130 * ONE), &setup.now()),
+        Err(Ok(Error::DeviationExceeded))
+    );
+}
+
+#[test]
+fn set_governance_rotates_both_keys_under_both_signatures() {
+    let setup = Setup::new();
+    let client = setup.client();
+    let (new_admin, new_co_admin) = (Address::generate(&setup.env), Address::generate(&setup.env));
+
+    assert!(signed_by_one!(
+        setup,
+        &setup.admin,
+        "set_governance",
+        (new_admin, new_co_admin),
+        try_set_governance
+    )
+    .is_err());
+
+    client
+        .mock_all_auths()
+        .set_governance(&new_admin, &new_co_admin);
+    assert_eq!(client.admin(), new_admin);
+    assert_eq!(client.co_admin(), new_co_admin);
+
+    // Rotation cannot be used to smuggle in a shared address.
+    assert_eq!(
+        client
+            .mock_all_auths()
+            .try_set_governance(&new_admin, &new_admin),
+        Err(Ok(Error::RolesNotDistinct))
+    );
+    assert_eq!(
+        client.mock_all_auths().try_set_publisher(&new_admin),
+        Err(Ok(Error::RolesNotDistinct))
+    );
+}
+
 #[test]
 fn set_config_rejects_values_that_would_disable_a_safeguard() {
     let setup = Setup::new();
@@ -602,6 +738,22 @@ fn set_config_rejects_values_that_would_disable_a_safeguard() {
         },
         OracleConfig {
             history_size: 0,
+            ..config()
+        },
+        // An unbounded history would make every publication rewrite a larger
+        // vector, degrading and then breaking the write path.
+        OracleConfig {
+            history_size: 10_000,
+            ..config()
+        },
+        // A zero timelock would let an upgrade be announced and applied in one
+        // transaction, so holders never see the announcement.
+        OracleConfig {
+            upgrade_timelock: 0,
+            ..config()
+        },
+        OracleConfig {
+            upgrade_timelock: u64::MAX,
             ..config()
         },
     ] {
@@ -658,6 +810,16 @@ fn upgrade_is_announced_on_chain_and_held_for_the_timelock() {
         Err(Ok(Error::UpgradeTimelockActive))
     );
 
+    // Once the timelock elapses the gate opens: the call no longer stops at
+    // `UpgradeTimelockActive`. It now fails deeper, in the host, because no wasm
+    // with this hash is installed — exercising that last step needs a deployed
+    // fixture and belongs with the testnet integration of Phase 1.
+    setup.advance(1);
+    assert_ne!(
+        client.try_apply_upgrade(),
+        Err(Ok(Error::UpgradeTimelockActive))
+    );
+
     client.cancel_upgrade();
     assert_eq!(client.pending_upgrade(), None);
     assert_eq!(
@@ -667,28 +829,36 @@ fn upgrade_is_announced_on_chain_and_held_for_the_timelock() {
 }
 
 #[test]
-fn upgrade_requires_the_admin() {
+fn upgrade_requires_both_governance_signatures() {
     let setup = Setup::new();
     let client = setup.client();
     let stranger = Address::generate(&setup.env);
     let wasm_hash = soroban_sdk::BytesN::from_array(&setup.env, &[7u8; 32]);
 
-    let unauthorized = client
-        .mock_auths(&[MockAuth {
-            address: &stranger,
-            invoke: &MockAuthInvoke {
-                contract: &setup.contract_id,
-                fn_name: "schedule_upgrade",
-                args: (wasm_hash.clone(),).into_val(&setup.env),
-                sub_invokes: &[],
-            },
-        }])
-        .try_schedule_upgrade(&wasm_hash);
-    assert!(unauthorized.is_err());
+    // Neither an outsider nor one half of governance can announce an upgrade.
+    for signer in [&stranger, &setup.admin, &setup.co_admin] {
+        assert!(signed_by_one!(
+            setup,
+            signer,
+            "schedule_upgrade",
+            (wasm_hash),
+            try_schedule_upgrade
+        )
+        .is_err());
+    }
     assert_eq!(client.pending_upgrade(), None);
 }
 
 // --- State rent ------------------------------------------------------------
+
+#[test]
+fn extend_ttl_tolerates_the_window_before_the_first_publication() {
+    // The maintenance job runs from deployment. The NAV entries do not exist
+    // yet, and extending a missing entry traps — taking the instance entry it
+    // was also meant to bump down with it.
+    let setup = Setup::new();
+    NavOracleClient::new(&setup.env, &setup.contract_id).extend_ttl();
+}
 
 #[test]
 fn extend_ttl_is_permissionless_and_keeps_the_feed_readable() {
