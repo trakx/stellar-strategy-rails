@@ -20,6 +20,7 @@ The rails are strategy-agnostic: once validated with EDO, additional tokenized p
 
 - [Technical Architecture](docs/ARCHITECTURE.md) — components, account model, flows (onboarding, mint, redeem, NAV publication, reconciliation), trust boundaries, and delivery phases.
 - [NAVOracle contract](contracts/nav-oracle/README.md) — interface, specification traceability and design notes for the first Soroban contract.
+- [Reading the NAVOracle](docs/NAV_ORACLE_TOUR.md) — a walkthrough of the contract for engineers new to Rust or Soroban.
 
 ## Contracts
 

@@ -50,6 +50,15 @@ const MIN_UPGRADE_TIMELOCK: u64 = 24 * 60 * 60;
 const MAX_UPGRADE_TIMELOCK: u64 = 90 * 24 * 60 * 60;
 const MAX_HISTORY_SIZE: u32 = 100;
 
+/// Bounds on the published NAV scale. 6 is USDC's own precision on EVM chains
+/// and the lowest any price convention uses; 18 is the highest. The scales in
+/// actual use sit inside that range — 7 for Stellar Classic assets, 8 for
+/// Chainlink feeds, 14 for Soroban price feeds — so a value outside it is a
+/// typo rather than a choice, and a large enough one would leave no room in
+/// `i128` for the NAV itself.
+const MIN_DECIMALS: u32 = 6;
+const MAX_DECIMALS: u32 = 18;
+
 #[contract]
 pub struct NavOracle;
 
@@ -83,9 +92,7 @@ impl NavOracle {
         feed: FeedDefinition,
         config: OracleConfig,
     ) -> Result<(), Error> {
-        if feed.resolution == 0 {
-            return Err(Error::InvalidConfig);
-        }
+        validate_feed(&feed)?;
         validate_roles(&admin, &co_admin, &publisher)?;
         validate_config(&config)?;
 
@@ -460,6 +467,16 @@ fn within_deviation_bound(previous: i128, current: i128, max_bps: u32) -> bool {
 /// SEP-40 tick: `floor(timestamp / resolution) * resolution`.
 fn trim(timestamp: u64, resolution: u32) -> u64 {
     timestamp - (timestamp % resolution as u64)
+}
+
+/// The feed definition is immutable once deployed, so it gets the same
+/// treatment as the config: the values a deployer could plausibly fat-finger
+/// are bounded by the contract rather than trusted.
+fn validate_feed(feed: &FeedDefinition) -> Result<(), Error> {
+    if feed.resolution == 0 || feed.decimals < MIN_DECIMALS || feed.decimals > MAX_DECIMALS {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
 }
 
 fn validate_config(config: &OracleConfig) -> Result<(), Error> {

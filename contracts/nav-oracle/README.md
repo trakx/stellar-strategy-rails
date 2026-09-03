@@ -10,13 +10,16 @@ pricing reference for mint and redeem — and, through its SEP-40 interface, a
 composable price feed any other Soroban protocol can read without a custom
 integration.
 
+New to Rust or Soroban? [Reading the NAVOracle](../../docs/NAV_ORACLE_TOUR.md)
+walks through the contract from first principles; this file is the reference.
+
 ## Running it
 
 No local Rust or Stellar toolchain is required; the Docker image *is* the
 toolchain.
 
 ```
-make test     # 30 unit tests
+make test     # 31 unit tests
 make build    # release .wasm for wasm32v1-none
 make lint     # clippy, warnings denied
 make check    # fmt + lint + test
@@ -78,7 +81,7 @@ implemented and covered.
 | Override path gated on a second, independent admin signature | `submit_nav_override`, `require_governance` | `override_admits_an_extreme_move_but_needs_both_signatures`, `override_bypasses_only_the_deviation_bound_and_the_rate_limit`, `override_is_not_blocked_by_the_rate_limit`, `a_single_governance_key_cannot_reach_a_price_the_breaker_would_reject` |
 | `NAVUpdated` event on every accepted publication | `NavUpdated` (`#[contractevent]`) | `submit_nav_stores_the_record_and_emits_the_event` |
 | `nav_age()` staleness threshold pauses dependent operations | `nav_age()`, `is_stale()` | `nav_age_grows_and_crosses_the_staleness_threshold` |
-| NAV as scaled `i128` with an explicit scale factor | `FeedDefinition::decimals` | `constructor_stores_feed_definition_and_config` |
+| NAV as scaled `i128` with an explicit scale factor | `FeedDefinition::decimals`, bounded to 6–18 | `constructor_stores_feed_definition_and_config`, `constructor_rejects_an_out_of_range_nav_scale` |
 | Bounded ring buffer of historical entries | `DataKey::History`, capped at `history_size` | `history_is_a_bounded_ring_buffer_ordered_newest_first` |
 | Risk parameters in storage, not in code; new intents only | `OracleConfig`, `set_config` | `set_config_requires_governance_and_applies_only_to_later_submissions` |
 | `__constructor` — no front-running window between deploy and init | `__constructor` | `constructor_rejects_invalid_config` |

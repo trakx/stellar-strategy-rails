@@ -179,6 +179,25 @@ fn constructor_rejects_invalid_config() {
 }
 
 #[test]
+fn constructor_rejects_an_out_of_range_nav_scale() {
+    // The scale is immutable after deployment — SEP-40 forbids changing it —
+    // so a fat-fingered value can only be caught here.
+    let env = Env::default();
+    for decimals in [0u32, 5, 19, 77] {
+        let (admin, co_admin, publisher) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        let feed = FeedDefinition { decimals, ..feed() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.register(NavOracle, (admin, co_admin, publisher, feed, config()))
+        }));
+        assert!(result.is_err());
+    }
+}
+
+#[test]
 fn constructor_rejects_an_address_holding_two_roles() {
     // `require_auth` twice on one address is satisfied by a single signature,
     // so a shared address would collapse the 2-of-2 with nothing to show for it.
