@@ -77,9 +77,9 @@ implemented and covered.
 | Only the authorized publisher may publish | `require_auth()` on `submit_nav` | `submit_nav_requires_the_authorized_publisher` |
 | Monotonic timestamps | strict tick comparison in `record_nav` | `rejects_ticks_that_are_not_strictly_later` |
 | Minimum-interval guard rate-limits submissions | `min_submission_interval` | `rate_limits_submissions_to_the_minimum_interval` |
-| Circuit breaker: reject beyond `MAX_DEVIATION`, **state untouched, no event** | `max_deviation_bps` in `record_nav` | `deviation_beyond_the_bound_is_rejected_leaving_state_untouched` |
-| Override path gated on a second, independent admin signature | `submit_nav_override`, `require_governance` | `override_admits_an_extreme_move_but_needs_both_signatures`, `override_bypasses_only_the_deviation_bound_and_the_rate_limit`, `override_is_not_blocked_by_the_rate_limit`, `a_single_governance_key_cannot_reach_a_price_the_breaker_would_reject` |
-| `NAVUpdated` event on every accepted publication | `NavUpdated` (`#[contractevent]`) | `submit_nav_stores_the_record_and_emits_the_event` |
+| Circuit breaker: reject beyond `max_deviation_bps`, **state untouched, no event** | `max_deviation_bps` in `record_nav` | `deviation_beyond_the_bound_is_rejected_leaving_state_untouched` |
+| Override path gated on both governance signatures | `submit_nav_override`, `require_governance` | `override_admits_an_extreme_move_but_needs_both_signatures`, `override_bypasses_only_the_deviation_bound_and_the_rate_limit`, `override_is_not_blocked_by_the_rate_limit`, `a_single_governance_key_cannot_reach_a_price_the_breaker_would_reject` |
+| `NavUpdated` event on every accepted publication | `#[contractevent]` | `submit_nav_stores_the_record_and_emits_the_event` |
 | `nav_age()` staleness threshold pauses dependent operations | `nav_age()`, `is_stale()` | `nav_age_grows_and_crosses_the_staleness_threshold` |
 | NAV as scaled `i128` with an explicit scale factor | `FeedDefinition::decimals`, bounded to 6–18 | `constructor_stores_feed_definition_and_config`, `constructor_rejects_an_out_of_range_nav_scale` |
 | Bounded ring buffer of historical entries | `DataKey::History`, capped at `history_size` | `history_is_a_bounded_ring_buffer_ordered_newest_first` |

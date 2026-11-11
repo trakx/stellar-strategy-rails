@@ -37,14 +37,16 @@ make check    # fmt + clippy + tests
 |---|---|---|
 | [`nav-oracle`](contracts/nav-oracle) | 1 | Implemented — SEP-40 price feed, signed publication, on-chain deviation bound, governed upgrade |
 | `subscription-escrow` | 2 | Specified ([§4.2](docs/ARCHITECTURE.md)) |
+| `evm-account` | 2 | Specified ([§5.1](docs/ARCHITECTURE.md)) |
+| `cctp-exit-wrapper` | 2 | Specified ([§8.2](docs/ARCHITECTURE.md)) |
 
 ## Delivery phases
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 — MVP | Token issuance (testnet), compliance & whitelist service, on-chain NAV publication | Planned |
-| 2 — Testnet | Automated mint/redeem engine at NAV, investor portal, reconciliation & reporting | Planned |
-| 3 — Mainnet | Performance fee & execution risk framework, mainnet launch, production hardening | Planned |
+| 1 — MVP | Token issuance (testnet), NAVOracle deployed on testnet, compliance & whitelist service for `G…` and `C…` accounts | Planned |
+| 2 — Testnet | SubscriptionEscrow and automated mint/redeem at NAV, investor portal (Stellar and EVM wallets), cross-chain gateway (CCTP in and out), reconciliation & reporting | Planned |
+| 3 — Mainnet | Fee engine & execution risk framework, mainnet launch with verified builds, production hardening | Planned |
 
 ## About Trakx
 
